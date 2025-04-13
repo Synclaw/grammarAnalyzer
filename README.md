@@ -155,137 +155,62 @@
 
 ## 二、核心模块实现
 ### 2.1 抽象语法树 (include/ast.h)
-```cpp
-#pragma once
-#include <vector>
-#include <memory>
-#include "lexer.h"
-
-// AST节点基类
-struct AstNode {
-    virtual ~AstNode() = default;
-    virtual std::string toString(int indent=0) const = 0;
-};
-
-// 程序根节点
-struct Program : AstNode {
-    std::vector<std::unique_ptr<AstNode>> stmts;
-    std::string toString(int indent) const override;
-};
-
-// 变量声明节点
-struct VarDecl : AstNode {
-    std::string type;
-    std::vector<std::string> names;
-    std::string toString(int indent) const override;
-};
-
-// 赋值语句节点
-struct Assignment : AstNode {
-    std::string ident;
-    bool is_bool;      // 区分:=和=赋值
-    std::unique_ptr<AstNode> expr;
-    std::string toString(int indent) const override;
-};
-```
+[ast.h](/include/ast.h)
 ### 2.2 语法分析器 (src/parser.cpp)
-递归下降分析入口
-```cpp
-#include "parser.h"
-#include <stdexcept>
-
-Program Parser::parse() {
-    consume(TokenType::LBRACE);
-    Program prog;
-    
-    // 解析声明语句
-    while(check(TokenType::INT) || check(TokenType::BOOL)) {
-        prog.stmts.push_back(parseDecl());
-    }
-    
-    // 解析执行语句
-    while(!check(TokenType::RBRACE)) {
-        prog.stmts.push_back(parseStmt());
-    }
-    
-    consume(TokenType::RBRACE);
-    return prog;
-}
-```
-表达式解析（算符优先法）
-```cpp
-std::unique_ptr<Expr> Parser::parseExpr() {
-    std::vector<std::unique_ptr<Expr>> output;
-    std::vector<Token> op_stack;
-    
-    output.push_back(parseTerm());
-    
-    // 处理加减运算符
-    while(check(TokenType::PLUS) || check(TokenType::MINUS)) {
-        Token op = advance();
-        while(!op_stack.empty() && 
-             getPrecedence(op_stack.back()) >= getPrecedence(op)) {
-            reduceStack(output, op_stack);
-        }
-        op_stack.push_back(op);
-        output.push_back(parseTerm());
-    }
-    
-    // ...处理剩余运算符...
-    return std::move(output.front());
-}
-```
+[parser.h](/include/parser.h)
 ### 2.3 错误处理机制
 ```cpp
 // 强制消费指定类型Token
-void Parser::consume(TokenType expect) {
-    if(peek().type != expect) {
-        std::string msg = "Expected " + tokenTypeToString(expect)
-                        + " at line " + std::to_string(peek().line);
-        throw ParseError(msg);
+void Parser::consume(TokenType expected, const std::string &expectedLexeme) {
+    Token token = currentToken();
+    if (token.type != expected || (!expectedLexeme.empty() && token.lexeme != expectedLexeme)) {
+        throw std::runtime_error("语法错误: 期待 " + expectedLexeme + "，但得到 " + token.lexeme);
     }
-    advance();
+    pos++;
 }
 
 // 错误恢复同步
-void Parser::synchronize() {
-    while(!isAtEnd()) {
-        switch(peek().type) {
-        case SEMICOLON: case RBRACE: 
-        case IF: case WHILE: case READ: case WRITE:
-            return;
-        default:
-            advance();
-        }
+bool Parser::match(TokenType type, const std::string &lexeme) {
+    Token token = currentToken();
+    if (token.type == type && (lexeme.empty() || token.lexeme == lexeme)) {
+        pos++;
+        return true;
     }
+    return false;
 }
 ```
 ## 三、测试验证
 ### 3.1 测试用例 (IO/TestCases/demo.lc)
 ```c
+//program 1: add two numbers.
 {
-    int x, y;
-    x = 3 * (5 + 2);
-    if x then y := true else y := false;
-    write x;
+	int a, b, c  ;
+	a = 1;
+	b = 2;
+	c = a + b ;
 }
 ```
 ### 3.2 AST输出 (IO/output/demo.parse_out.txt)
 ```text
 Program
-├─ VarDecl [int] (x, y)
-├─ Assignment: x = 
-│  └─ BinOp(*)
-│     ├─ Literal(3)
-│     └─ BinOp(+)
-│        ├─ Literal(5)
-│        └─ Literal(2)
-├─ IfStmt (x)
-│  ├─ Then:
-│  │  └─ Assignment: y := true
-│  └─ Else:
-│     └─ Assignment: y := false
-└─ WriteStmt (x)
+  Declarations:
+    Decl: int a b c 
+  Statements:
+    ExprStmt:
+      BinaryExpr: =
+        Identifier: a
+        Literal: 1
+    ExprStmt:
+      BinaryExpr: =
+        Identifier: b
+        Literal: 2
+    ExprStmt:
+      BinaryExpr: =
+        Identifier: c
+        BinaryExpr: +
+          Identifier: a
+          Identifier: b
+
 ```
 ## 四、关键问题解决
 ### 4.1 左递归消除
@@ -296,47 +221,35 @@ Program
 
 ```cpp
 // parser.cpp
-ExprPtr parseExpr() {
-    auto expr = parseTerm();
-    while(consumeIf(PLUS) || consumeIf(MINUS)) {
-        expr = makeBinOp(prev_token, expr, parseTerm());
+std::unique_ptr<ExprNode> Parser::parseExpr() {
+    auto left = parseTerm();
+    while (currentToken().type == TokenType::OPERATOR &&
+           (currentToken().lexeme == "+" || currentToken().lexeme == "-")) {
+        string op = currentToken().lexeme;
+        consume(TokenType::OPERATOR, op);
+        auto right = parseTerm();
+        left = std::make_unique<BinaryExprNode>(op, std::move(left), std::move(right));
     }
-    return expr;
+    return left;
 }
 ```
-### 4.2 悬垂else问题
-```cpp
-// if语句解析逻辑
-std::unique_ptr<IfStmt> Parser::parseIf() {
-    auto stmt = std::make_unique<IfStmt>();
-    stmt->cond = parseIdent(); // LittleC要求条件为简单变量
-    
-    consume(TokenType::THEN);
-    stmt->then_branch = parseStmt();
-    
-    // 优先匹配最近if
-    if(consumeIf(TokenType::ELSE)) {
-        stmt->else_branch = parseStmt();
-    }
-    return stmt;
-}
-```
-## 五、实验总结
-实现效果
-完整支持LittleC文法定义，可生成结构化AST，检测15+种语法错误类型
 
-创新点
+## 实验收获
 
-混合使用递归下降与算符优先法
+* 构建错误恢复机制（跳过非法token继续解析）
+* 尝试定位错误到行列，并标注上下文（未完全实现）
 
-实现错误定位与恢复机制
+### 不足
 
-支持图形化AST输出
+未处理Tab字符（按4空格计算）
 
-改进方向
+暂不支持Unicode字符
 
-增加符号表实现语义检查
+### 改进方向
+实现校准功能
 
-支持更多调试信息输出
+添加错误位置高亮显示
 
-优化AST内存管理
+语法扩展
+
+实现多线程词法分析
